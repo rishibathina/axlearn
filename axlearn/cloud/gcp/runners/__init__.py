@@ -10,6 +10,7 @@ from axlearn.cloud.gcp.job import (
     exclusive_topology_annotations,
     exclusive_topology_annotations_leaderworkerset,
     exclusive_topology_annotations_leaderworkerset_subslice,
+    exclusive_topology_annotations_leaderworkerset_subslice_8x8,
 )
 from axlearn.cloud.gcp.job_flink import FlinkTPUGKEJob
 from axlearn.cloud.gcp.job_pathways import GKEPathwaysJobSet
@@ -27,6 +28,7 @@ from axlearn.cloud.gcp.pathways_utils import (
     PathwaysMultiheadReplicatedJob,
     PathwaysReplicatedJob,
     PathwaysLeaderWorkerSubslice4x4Template,
+    PathwaysLeaderWorkerSubslice8x8Template,
 )
 from axlearn.cloud.gcp.runners.base import BaseRunnerJob
 from axlearn.cloud.gcp.runners.gke import FlinkGKERunnerJob, GKERunnerJob, LWSRunnerJob
@@ -78,6 +80,12 @@ def named_runner_configs(
             inner=GKELeaderWorkerSet.default_config().set(
                 builder=PathwaysLeaderWorkerSubslice4x4Template.default_config(),
                 annotations=config_for_function(exclusive_topology_annotations_leaderworkerset_subslice)
+            )
+        ),
+        "gke_tpu_lws_pathways_subslice_flex": LWSRunnerJob.default_config().set(
+            inner=GKELeaderWorkerSet.default_config().set(
+                builder=PathwaysLeaderWorkerSubsliceTemplate.default_config(),
+                annotations=config_for_function(exclusive_topology_annotations_leaderworkerset_subslice_8x8)
             )
         ),
     }

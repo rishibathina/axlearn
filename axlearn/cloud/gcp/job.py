@@ -378,3 +378,12 @@ def exclusive_topology_annotations_leaderworkerset_subslice() -> dict:
     node-pools.
     """
     return {"leaderworkerset.sigs.k8s.io/exclusive-topology": "google.com/gke-tpu-sub-slice-4x4"}
+
+def exclusive_topology_annotations_leaderworkerset_subslice_8x8() -> dict:
+    """Used for TPU GKELeaderWorkerSet.
+
+    The exclusive topology annotation will ensure that all Pods will have affinity
+    rules added that will ensure that they are fully scheduled on the same pod-slice
+    node-pools.
+    """
+    return {"leaderworkerset.sigs.k8s.io/exclusive-topology": "google.com/gke-tpu-sub-slice-8x8"}

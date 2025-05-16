@@ -40,6 +40,7 @@ class BaseLeaderWorkerTemplate(FlagConfigurable):
         output_dir: An optional GCS path to upload LWS outputs to.
         """
 
+
         name: Required[str] = REQUIRED
         # TODO: Change this to be a list of str[], to support different commands
         # between leader and workers
@@ -48,6 +49,7 @@ class BaseLeaderWorkerTemplate(FlagConfigurable):
         env_vars: dict[str, str] = {}
         service_account: Optional[str] = None
         output_dir: Optional[str] = None
+        priority_class: Optional[str] = None
 
     @classmethod
     def define_flags(cls, fv):
@@ -70,6 +72,12 @@ class BaseLeaderWorkerTemplate(FlagConfigurable):
             "If specified, the directory to store outputs (such as logs).",
             **common_kwargs,
         )
+        flags.DEFINE_string(
+            "priority_class",
+            None,
+            "The GKE PriorityClass for the LWS pods.",
+            **common_kwargs,
+        )
 
     @classmethod
     def from_flags(cls, fv: flags.FlagValues, **kwargs):
@@ -78,6 +86,7 @@ class BaseLeaderWorkerTemplate(FlagConfigurable):
             "k8s_service_account", default="default", fv=fv
         )
         cfg.accelerator.set(instance_type=fv.instance_type, num_replicas=fv.num_replicas)
+        cfg.priority_class = fv.priority_class
         return cfg
 
     def __init__(self, cfg: Config, *, bundler: Bundler):
@@ -109,6 +118,7 @@ class TPULeaderWorkerTemplate(BaseLeaderWorkerTemplate):
                 "projects/<reservation_project>/reservations/<reservation>"
                 https://github.com/GoogleCloudPlatform/ai-on-gke/blob/889ec98f9b9a7aec05eb0f9890ada1f4c59b6159/tpu-provisioner/internal/cloud/gke.go#L328-L334
         """
+        subslice_type: Optional[str] = None # Added subslice_type
 
         reservation: Optional[str] = None
         reservation_project: Optional[str] = None
@@ -120,6 +130,12 @@ class TPULeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         flags.DEFINE_string("reservation", None, "TPU reservation.", **common_kwargs)
         flags.DEFINE_string(
             "reservation_project", None, "TPU reservation project.", **common_kwargs
+        )
+        flags.DEFINE_string(
+            "subslice_type",
+            None,
+            "The subslice dimension for Pathways RM, e.g., '4x4', '8x8'. This is typically used by wrapper templates.",
+            **common_kwargs,
         )
 
     @classmethod
@@ -136,6 +152,7 @@ class TPULeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         cfg.reservation_project = cfg.reservation_project or gcp_settings(
             "gke_reservation_project", required=False, fv=fv
         )
+        cfg.subslice_type = fv.subslice_type # Read the subslice_type flag
         return cfg
 
     def __init__(self, cfg, *, bundler):
@@ -185,6 +202,9 @@ class TPULeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             containers=[self._build_container()],
             serviceAccountName=cfg.service_account,
         )
+        if cfg.priority_class:
+            spec["priorityClassName"] = cfg.priority_class
+
 
         return dict(metadata=dict(annotations=annotations, labels=labels), spec=spec)
 

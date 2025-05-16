@@ -27,7 +27,7 @@ from axlearn.common.utils import Nested
 
 # The port used by pathways proxy server.
 # The specific value is not important, as long as clients and servers use the same port.
-_PATHWAYS_PROXY_PORT = 29000
+_PATHWAYS_PROXY_PORT = 38681
 # The port used by pathways resource manager server.
 # The specific value is not important, as long as clients and servers use the same port.
 _PATHWAYS_RESOURCE_MANAGER_PORT = 29001
@@ -59,6 +59,68 @@ _PATHWAYS_WORKER_REPLICATED_JOB_NAME = "pathways-worker"
 _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY = "axlearn/nodepool_type"
 _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE = "workload"
 
+_JETSTREAM_CONTAINER_PORT = 9000
+
+_JETSTREAM_HTTP_CONTAINER_NAME = "jetstream-http"
+_JETSTREAM_HTTP_IMAGE_TAG = "v0.2.3"
+_JETSTREAM_HTTP_CONTAINER_IMAGE = (
+    f"us-docker.pkg.dev/cloud-tpu-images/inference/jetstream-http:{_JETSTREAM_HTTP_IMAGE_TAG}"
+)
+_JETSTREAM_HTTP_CONTAINER_PORT = 8000
+
+def determine_host_bounds(topology) -> str:
+    if topology == "16x16":
+        return "8,8,1"
+    elif topology == "8x16":
+        return "4,8,1"
+    elif topology == "8x8":
+        return "4,4,1"
+    elif topology == "4x8":
+        return "2,4,1"
+    elif topology == "4x4":
+        return "2,2,1"
+    elif topology == "2x4":
+        return "1,2,1"
+    elif topology == "2x2":
+        return "1,1,1"
+    else:
+        return "invalid topology" 
+
+def determine_lws_subslice_size(topology) -> int:
+    if topology == "16x16":
+        return 65
+    elif topology == "8x16":
+        return 33
+    elif topology == "8x8":
+        return 17
+    elif topology == "4x8":
+        return 9
+    elif topology == "4x4":
+        return 5
+    elif topology == "2x4":
+        return 3
+    elif topology == "2x2":
+        return 2
+    else:
+        raise ValueError(f"Unsupported subslice_type for LWS size: {topology}")
+
+# def determine_jetstream_params(topology) -> [str,str]:
+#     if topology == "16x16":
+#         return 
+#     elif topology == "8x16":
+#         return 
+#     elif topology == "8x8":
+#         return 
+#     elif topology == "4x8":
+#         return 
+#     elif topology == "4x4":
+#         return 
+#     elif topology == "2x4":
+#         return 
+#     elif topology == "2x2":
+#         return "1,1,1"
+#     else:
+#         raise ValueError(f"Unsupported subslice_type for LWS size: {topology}") 
 
 def get_pathways_head_address(job_name: str) -> str:
     """Returns the address of the pathways head pod."""
@@ -709,6 +771,245 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
 
 
 # TODO: RUNNER for subslice 
+class PathwaysLeaderWorkerSubsliceTemplate(BaseLeaderWorkerTemplate):
+    """Builds a LeaderWorkerTemplate spec for TPUs"""
+
+    @config_class
+    class Config(BaseLeaderWorkerTemplate.Config):
+        """Configures PathwaysLeaderWorkerTemplate
+        Attributes:
+            inner: The wrapped TPULeaderWorkerTemplate configuration
+        """
+        subslice_type: str = "8x8"
+
+        inner: Required[TPULeaderWorkerTemplate.Config] = REQUIRED
+
+    def __init__(self, cfg, *, bundler):
+        super().__init__(cfg, bundler=bundler)
+        self._bundler = bundler
+        self._inner: TPULeaderWorkerTemplate = cfg.inner.instantiate(bundler=self._bundler)
+        self._tpu_type = infer_tpu_type(cfg.inner.accelerator.instance_type)
+        if self._tpu_type not in USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS:
+            raise NotImplementedError(f"Missing system characteristics for {self._tpu_type}")
+
+    @classmethod
+    def default_config(cls):
+        cfg = super().default_config()
+        return cfg.set(inner=TPULeaderWorkerTemplate.default_config())
+    
+    @classmethod
+    def define_flags(cls, fv):
+        super().define_flags(fv) 
+        common_kwargs = dict(flag_values=fv, allow_override=True)
+        flags.DEFINE_string(
+            "subslice_type",
+            "8x8", 
+            "The subslice dimension for Pathways RM, e.g., '4x4', '8x8'.",
+            **common_kwargs,
+        )
+
+    @classmethod
+    def from_flags(cls, fv: flags.FlagValues, **kwargs) -> Config:
+        cfg: PathwaysLeaderWorkerSubsliceTemplate.Config = super().from_flags(fv, **kwargs)
+        cfg.subslice_type = fv.subslice_type # Read the flag value.
+        return cfg
+
+    def _build_pathways_worker_container(self) -> dict:
+        cfg: TPULeaderWorkerTemplate = self._inner.config
+        cfg_subslice: PathwaysLeaderWorkerSubsliceTemplate.Config = self.config # For subslice_type, output_dir
+        # pylint: disable-next=protected-access
+        container = self._inner._build_container()
+        worker_container = copy.deepcopy(container)
+
+        worker_container["args"] = [
+            f"--server_port={_PATHWAYS_WORKER_PORT}",
+            "--resource_manager_address=$(LWS_LEADER_ADDRESS):"
+            + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
+            f"--gcs_scratch_location={cfg.output_dir}/pathways-staging",
+        ]
+
+        worker_container["image"] = _PATHWAYS_SERVER_IMAGE
+        ports = worker_container.get("ports", [])
+        ports.append({"containerPort": _PATHWAYS_WORKER_PORT})
+        worker_container["ports"] = ports
+
+        tpu_host_bounds = determine_host_bounds(cfg_subslice.subslice_type)
+        if tpu_host_bounds == "invalid topology":
+            raise ValueError(f"Invalid subslice_type: {cfg_subslice.subslice_type}")
+
+        if cfg_subslice.subslice_type == "16x16":
+            full_tpu = "true,true,true"
+        else:
+            full_tpu = "false,false,false"
+        
+            
+        subslice_envs = [{
+            "name": "TPU_HOST_BOUNDS",
+            "value": tpu_host_bounds,
+        }, {
+            "name": "TPU_TOPOLOGY_WRAP",
+            "value": full_tpu,
+        }]
+        worker_container["env"] = subslice_envs
+
+        # Command will be executed by the head node, and it will compile the model and
+        # distribute works to workers.
+        # So workers doesn't need to execute the command by themselves.
+        worker_container.pop("command")
+        return worker_container
+
+    def build_worker_pod(self) -> dict:
+        # pylint: disable-next=protected-access
+        pod = self._inner._build_pod()
+        worker_pod = copy.deepcopy(pod)
+
+        pod_spec = worker_pod.get("spec", {})
+
+        pod_spec["containers"] = [self._build_pathways_worker_container()]
+
+        worker_pod["spec"] = pod_spec
+
+        return worker_pod
+
+    def _build_pathways_proxy_container(self) -> dict:
+        cfg: TPULeaderWorkerTemplate = self._inner.config
+        staging_location = f"{cfg.output_dir}/pathways-staging"
+
+        return dict(
+            name=_PATHWAYS_PROXY_CONTAINER_NAME,
+            image=_PATHWAYS_PROXY_IMAGE,
+            args=[
+                f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
+                f"--server_port={_PATHWAYS_PROXY_PORT}",
+                f"--gcs_scratch_location={staging_location}",
+            ],
+            ports=[dict(containerPort=_PATHWAYS_PROXY_PORT)],
+        )
+
+    def _build_pathways_rm_container(self) -> dict:
+        cfg: TPULeaderWorkerTemplate = self._inner.config
+        cfg_subslice: PathwaysLeaderWorkerSubsliceTemplate.Config = self.config 
+        staging_location = f"{cfg.output_dir}/pathways-staging"
+
+        system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
+        pathways_tpu_version = get_pathways_tpu_version(system.gce_machine_type)
+
+        return dict(
+            name=_PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME,
+            image=_PATHWAYS_SERVER_IMAGE,
+            env=[
+                {
+                    "name": "TPU_SKIP_MDS_QUERY",
+                    "value": "true",
+                },
+                {
+                    "name": "HOST_ADDRESS",
+                    "value": "$(LWS_LEADER_ADDRESS)",
+                },
+            ],
+            args=[
+                f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
+                "--node_type=resource_manager",
+                "--instance_count=1",
+                f"--instance_type={pathways_tpu_version}:{cfg_subslice.subslice_type}",
+                f"--gcs_scratch_location={staging_location}",
+            ],
+        )
+
+    def _build_jetstream_pathways_container(self) -> dict:
+        cfg: TPULeaderWorkerTemplate.Config = self.config
+
+        return dict(
+            name=cfg.name,
+            image="us-docker.pkg.dev/cloud-tpu-images/inference/jetstream-pathways:v0.2.0",
+            args=[
+                "MaxText/configs/v5e/inference/llama2_70b_v5e-16.yml",
+                "model_name=llama2-70b",
+                "load_parameters_path=gs://vivianrwu-jetstream-ckpts/maxtext/public-preview/llama-2-70b-20250311/int8",
+                "max_prefill_predict_length=1024",
+                "max_target_length=2048",
+                "async_checkpointing=false",
+                "steps=1",
+                "ici_fsdp_parallelism=1",
+                "ici_autoregressive_parallelism=8",
+                "ici_tensor_parallelism=8",
+                "scan_layers=false",
+                "weight_dtype=bfloat16",
+                "per_device_batch_size=10",
+                "enable_single_controller=true",
+                "quantization=int8",
+                "quantize_kvcache=true",
+                "checkpoint_is_quantized=true",
+                "enable_model_warmup=false",
+            ],
+            imagePullPolicy="Always",
+            ports=[{"containerPort": _JETSTREAM_CONTAINER_PORT}],
+            readinessProbe=dict(
+                httpGet=dict(
+                    path="/healthcheck",
+                    port=_JETSTREAM_HTTP_CONTAINER_PORT,
+                    scheme="HTTP",
+                ),
+                periodSeconds=60,
+                failureThreshold=10,
+            ),
+            livenessProbe=dict(
+                httpGet=dict(
+                    path="/healthcheck",
+                    port=_JETSTREAM_HTTP_CONTAINER_PORT,
+                    scheme="HTTP",
+                ),
+                periodSeconds=60,
+                failureThreshold=10,
+            ),
+            startupProbe=dict(
+                httpGet=dict(
+                    path="/healthcheck",
+                    port=_JETSTREAM_HTTP_CONTAINER_PORT,
+                    scheme="HTTP",
+                ),
+                periodSeconds=1,
+                initialDelaySeconds=600,
+                failureThreshold=10000,
+            ),
+        )
+
+    def _build_jetstream_http_container(self) -> dict:
+        return dict(
+            name=_JETSTREAM_HTTP_CONTAINER_NAME,
+            image=_JETSTREAM_HTTP_CONTAINER_IMAGE,
+            ports=[dict(containerPort=_JETSTREAM_HTTP_CONTAINER_PORT)],
+        )
+
+    def build_leader_pod(self) -> Nested[Any]:
+        # pylint: disable-next=protected-access
+        pod = self._inner._build_pod()
+        leader_pod = copy.deepcopy(pod)
+
+        pod_spec = leader_pod.get("spec", {})
+
+        pod_spec["containers"] = [
+            self._build_jetstream_http_container(),
+            self._build_jetstream_pathways_container(),
+            self._build_pathways_proxy_container(),
+            self._build_pathways_rm_container(),
+        ]
+
+        leader_pod["spec"] = pod_spec
+        return leader_pod
+
+    def __call__(self) -> Nested[Any]:
+        system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
+        cfg_template: PathwaysLeaderWorkerSubsliceTemplate.Config = self.config
+
+        lws_size = determine_lws_subslice_size(cfg_template.subslice_type)
+
+        return dict(
+            size=lws_size,
+            leaderTemplate=self.build_leader_pod(),
+            workerTemplate=self.build_worker_pod(),
+        )
+
 class PathwaysLeaderWorkerSubslice4x4Template(BaseLeaderWorkerTemplate):
     """Builds a LeaderWorkerTemplate spec for TPUs"""
 
@@ -826,14 +1127,69 @@ class PathwaysLeaderWorkerSubslice4x4Template(BaseLeaderWorkerTemplate):
             ],
         )
 
-    def _build_head_container(self) -> dict:
+    def _build_jetstream_pathways_container(self) -> dict:
         cfg: TPULeaderWorkerTemplate.Config = self.config
 
         return dict(
             name=cfg.name,
-            image=self._bundler.id(cfg.name),
-            command=["bash", "-c", cfg.command],
+            image="us-docker.pkg.dev/cloud-tpu-images/inference/jetstream-pathways:v0.2.0",
+            args=[
+                "MaxText/configs/v5e/inference/llama2_70b_v5e-16.yml",
+                "model_name=llama2-70b",
+                "load_parameters_path=gs://vivianrwu-jetstream-ckpts/maxtext/public-preview/llama-2-70b-20250311/int8",
+                "max_prefill_predict_length=1024",
+                "max_target_length=2048",
+                "async_checkpointing=false",
+                "steps=1",
+                "ici_fsdp_parallelism=1",
+                "ici_autoregressive_parallelism=2",
+                "ici_tensor_parallelism=8",
+                "scan_layers=false",
+                "weight_dtype=bfloat16",
+                "per_device_batch_size=10",
+                "enable_single_controller=true",
+                "quantization=int8",
+                "quantize_kvcache=true",
+                "checkpoint_is_quantized=true",
+                "enable_model_warmup=false",
+            ],
             imagePullPolicy="Always",
+            ports=[{"containerPort": _JETSTREAM_CONTAINER_PORT}],
+            readinessProbe=dict(
+                httpGet=dict(
+                    path="/healthcheck",
+                    port=_JETSTREAM_HTTP_CONTAINER_PORT,
+                    scheme="HTTP",
+                ),
+                periodSeconds=60,
+                failureThreshold=10,
+            ),
+            livenessProbe=dict(
+                httpGet=dict(
+                    path="/healthcheck",
+                    port=_JETSTREAM_HTTP_CONTAINER_PORT,
+                    scheme="HTTP",
+                ),
+                periodSeconds=60,
+                failureThreshold=10,
+            ),
+            startupProbe=dict(
+                httpGet=dict(
+                    path="/healthcheck",
+                    port=_JETSTREAM_HTTP_CONTAINER_PORT,
+                    scheme="HTTP",
+                ),
+                periodSeconds=1,
+                initialDelaySeconds=600,
+                failureThreshold=10000,
+            ),
+        )
+
+    def _build_jetstream_http_container(self) -> dict:
+        return dict(
+            name=_JETSTREAM_HTTP_CONTAINER_NAME,
+            image=_JETSTREAM_HTTP_CONTAINER_IMAGE,
+            ports=[dict(containerPort=_JETSTREAM_HTTP_CONTAINER_PORT)],
         )
 
     def build_leader_pod(self) -> Nested[Any]:
@@ -844,7 +1200,8 @@ class PathwaysLeaderWorkerSubslice4x4Template(BaseLeaderWorkerTemplate):
         pod_spec = leader_pod.get("spec", {})
 
         pod_spec["containers"] = [
-            self._build_head_container(),
+            self._build_jetstream_http_container(),
+            self._build_jetstream_pathways_container(),
             self._build_pathways_proxy_container(),
             self._build_pathways_rm_container(),
         ]
